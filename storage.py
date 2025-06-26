@@ -190,8 +190,8 @@ class DataLog:
         # Iterate over a copy of the items to prevent mutation issues during the loop.
         for ts, payloads_at_step in list(self.raw_payloads.items()):
             block_age = current_block - self.blocks[ts]
-            if not (61 <= block_age <= 120):
-                if block_age > 120:
+            if not (300 <= block_age <= 600):
+                if block_age > 600:
                     logger.warning(f"Discarding stale raw payloads at timestep {ts}")
                     processed_payload_keys.extend([(ts, u) for u in payloads_at_step.keys()])
                 continue
