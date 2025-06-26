@@ -119,7 +119,6 @@ def main():
                 mg.sync(subtensor=sub)
                 logging.info("Metagraph synced.")
 
-            # --- Get data and append to log ---
             try:
                 price = float(
                     requests.get(
@@ -129,20 +128,19 @@ def main():
                 )
             except Exception as e:
                 logging.error(f"Failed to fetch BTC price: {e}")
-                continue  # Skip this block if we can't get a price
-
+                continue  # Skip block
             payloads = get_miner_payloads(netuid=args.netuid, mg=mg)
             datalog.append_step(current_block, price, payloads)
 
-            # --- Process pending payloads ---
             if current_block >= next_process and len(datalog.blocks) >= 70:
                 logging.info("Decrypting and processing pending payloads...")
                 asyncio.run(datalog.process_pending_payloads())
                 next_process = current_block + PROCESS_INTERVAL
 
-            # --- Set weights in a background thread ---
-            if current_block >= next_task and (
-                weight_thread is None or not weight_thread.is_alive()
+            if (
+                current_block >= next_task
+                and (weight_thread is None or not weight_thread.is_alive())
+                and len(datalog.blocks) >= config.LAG * 2 + 1
             ):
 
                 def worker(block_snapshot: int, metagraph: bt.metagraph):
@@ -164,7 +162,6 @@ def main():
                         weights_logger.info("Salience unavailable.")
                         return
 
-                    # Set weights only for UIDs that are currently active in the metagraph.
                     uids_to_set = metagraph.uids.tolist()
                     w = torch.tensor(
                         [sal.get(uid, 0.0) for uid in uids_to_set],
@@ -192,7 +189,6 @@ def main():
                 weight_thread.start()
                 next_task = current_block + config.TASK_INTERVAL
 
-            # --- Periodically save the log ---
             if current_block >= next_save:
                 datalog.save(DATALOG_PATH)
                 next_save = current_block + SAVE_INTERVAL
