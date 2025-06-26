@@ -119,16 +119,47 @@ def main():
                 mg.sync(subtensor=sub)
                 logging.info("Metagraph synced.")
 
+            price = None
             try:
-                price = float(
-                    requests.get(
-                        "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-                        timeout=5,
-                    ).json()["price"]
+                response = requests.get(
+                    "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+                    timeout=5,
                 )
+                response.raise_for_status()
+                price = float(response.json()["price"])
+                logging.info(f"Fetched BTC price from Binance: {price}")
             except Exception as e:
-                logging.error(f"Failed to fetch BTC price: {e}")
-                continue  # Skip block
+                logging.warning(f"Failed to fetch price from Binance: {e}")
+
+            if price is None:
+                try:
+                    response = requests.get(
+                        "https://api.coinbase.com/v2/prices/BTC-USDT/spot", timeout=5
+                    )
+                    response.raise_for_status()
+                    price = float(response.json()["data"]["amount"])
+                    logging.info(f"Fetched BTC price from Coinbase: {price}")
+                except Exception as e:
+                    logging.warning(f"Failed to fetch price from Coinbase: {e}")
+            
+            if price is None:
+                try:
+                    response = requests.get(
+                        "https://api.kraken.com/0/public/Ticker?pair=XBTUSDT", timeout=5
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    pair = list(data["result"].keys())[0]
+                    price = float(data["result"][pair]["c"][0])
+                    logging.info(f"Fetched BTC price from Kraken: {price}")
+                except Exception as e:
+                    logging.warning(f"Failed to fetch price from Kraken: {e}")
+
+            if price is None:
+                logging.error("Failed to fetch BTC price from all sources.")
+                continue
+
+            
             payloads = get_miner_payloads(netuid=args.netuid, mg=mg)
             datalog.append_step(current_block, price, payloads)
 
