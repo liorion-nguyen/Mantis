@@ -30,7 +30,7 @@ sub = bt.subtensor(network=NETWORK)
 
 MAX_PAYLOAD_BYTES = 25 * 1024 * 1024
 
-def get_miner_payloads(
+async def get_miner_payloads(
     netuid: int = 123, mg: bt.metagraph = None
 ) -> dict[int, bytes]:
     """
@@ -75,15 +75,9 @@ def get_miner_payloads(
         except Exception as e:
             logger.warning(f"Download failed for UID {uid} at {object_url}: {e}")
 
-    async def _run():
-        await asyncio.gather(*(
-            _fetch_one(int(u)) for u in mg.uids
-        ), return_exceptions=True)
-
-    try:
-        asyncio.run(_run())
-    except RuntimeError:
-        asyncio.get_event_loop().run_until_complete(_run())
+    await asyncio.gather(*(
+        _fetch_one(int(u)) for u in mg.uids
+    ), return_exceptions=True)
 
     return payloads
 
