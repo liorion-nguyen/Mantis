@@ -10,6 +10,7 @@ import asyncio
 import time
 import secrets
 import aiohttp
+import copy
 
 from timelock import Timelock
 
@@ -36,7 +37,6 @@ def _precompute_encrypted_zero():
     """Creates a pre-computed tlock payload for the zero vector."""
     try:
         tlock = Timelock(DRAND_PUBLIC_KEY)
-        # Use a fixed, past round that is guaranteed to have a signature.
         round_num = 1
         vector_str = str(ZERO_VEC)
         salt = secrets.token_bytes(32)
@@ -47,7 +47,6 @@ def _precompute_encrypted_zero():
         return json.dumps(payload_dict).encode("utf-8")
     except Exception as e:
         logger.error(f"Failed to pre-compute encrypted zero vector, using fallback: {e}")
-        # This fallback will be safely handled as a parsing failure later.
         return b'{"round": 1, "ciphertext": "error"}'
 
 ENCRYPTED_ZERO_PAYLOAD = _precompute_encrypted_zero()
@@ -59,32 +58,34 @@ class DataLog:
 
     This class manages the complete state of miner data, including block numbers,
     BTC prices, raw encrypted payloads, and a cache for decrypted plaintext data.
-    It is designed to be the single source of truth, ensuring data integrity and
-    consistent history length across all miners.
+    It is designed to be the single source of truth.
 
-    The log is persisted to a single file, making it a self-contained and
-    portable data store.
+    The log is persisted to a single file, making it a self-contained and portable data store.
     """
 
     def __init__(self):
-        # The block number for each timestep.
         self.blocks: List[int] = []
-        # The BTC price at the time of each block.
         self.btc_prices: List[float] = []
-        # A dense cache of decrypted plaintext data. Maps timestep -> uid -> vector.
         self.plaintext_cache: List[Dict[int, List[float]]] = []
-        # A sparse dictionary of raw, unprocessed payloads.
-        # Maps timestep -> uid -> encrypted_bytes.
-        # This is a "to-do" list; payloads are removed after processing.
         self.raw_payloads: Dict[int, Dict[int, bytes]] = {}
 
-        # Initialize tlock and cache for Drand info
+        self._lock = asyncio.Lock()
+
         self.tlock = Timelock(DRAND_PUBLIC_KEY)
         self._drand_info: Dict[str, Any] = {}
         self._drand_info_last_update: float = 0
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        if '_lock' in state:
+            del state['_lock']
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = asyncio.Lock()
+
     async def _get_drand_info(self) -> Dict[str, Any]:
-        """Gets and caches Drand network info."""
         if not self._drand_info or time.time() - self._drand_info_last_update > 3600:
             try:
                 url = f"{DRAND_API}/beacons/{DRAND_BEACON_ID}/info"
@@ -100,8 +101,6 @@ class DataLog:
         return self._drand_info
 
     async def _get_drand_signature(self, round_num: int) -> bytes | None:
-        """Fetches the signature for a specific Drand round."""
-        # Add a small buffer to give the beacon time to publish.
         await asyncio.sleep(2)
         try:
             url = f"{DRAND_API}/beacons/{DRAND_BEACON_ID}/rounds/{round_num}"
@@ -124,32 +123,29 @@ class DataLog:
             logger.error(f"-> Error fetching signature for round {round_num}: {e}")
             return None
 
-    def append_step(
+    async def append_step(
         self, block: int, btc_price: float, payloads: Dict[int, bytes]
     ) -> None:
-        """Appends a new timestep to the log."""
-        self.blocks.append(block)
-        self.btc_prices.append(btc_price)
-        self.plaintext_cache.append({})  # Add a new, empty dict for this timestep.
+        async with self._lock:
+            self.blocks.append(block)
+            self.btc_prices.append(btc_price)
+            self.plaintext_cache.append({})
 
-        current_timestep = len(self.blocks) - 1
-        self.raw_payloads[current_timestep] = {}
+            current_timestep = len(self.blocks) - 1
+            self.raw_payloads[current_timestep] = {}
 
-        # Ensure all known miners have a default entry for this step if missing.
-        all_known_uids = self.get_all_uids()
-        for uid in all_known_uids:
-            if uid not in payloads:
-                payloads[uid] = ENCRYPTED_ZERO_PAYLOAD
+            all_known_uids = self._get_all_uids_unsafe()
+            for uid in all_known_uids:
+                if uid not in payloads:
+                    payloads[uid] = ENCRYPTED_ZERO_PAYLOAD
 
-        for uid, payload in payloads.items():
-            self.raw_payloads[current_timestep][uid] = payload
+            for uid, payload in payloads.items():
+                self.raw_payloads[current_timestep][uid] = payload
 
-            # If this is a new miner, backfill their entire history with zeros.
-            if not self.is_known_uid(uid):
-                self._backfill_new_uid(uid)
+                if not self._is_known_uid_unsafe(uid):
+                    self._backfill_new_uid_unsafe(uid)
 
-    def get_all_uids(self) -> List[int]:
-        """Returns a sorted list of all unique UIDs ever seen in the log."""
+    def _get_all_uids_unsafe(self) -> List[int]:
         uids = set()
         for step_cache in self.plaintext_cache:
             uids.update(step_cache.keys())
@@ -157,50 +153,54 @@ class DataLog:
             uids.update(step_payloads.keys())
         return sorted(list(uids))
 
+    def get_all_uids_sync(self) -> List[int]:
+        return self._get_all_uids_unsafe()
+
     def is_known_uid(self, uid: int) -> bool:
-        """Check if a UID has any data in the first timestep."""
         if not self.plaintext_cache:
             return False
         return uid in self.plaintext_cache[0]
 
-    def _backfill_new_uid(self, uid: int) -> None:
-        """Fills the history for a new UID with default zero values."""
-        # There is no history to backfill if this is the first or second entry.
-        # The loop below will be empty anyway, this just prevents log spam.
+    def _is_known_uid_unsafe(self, uid: int) -> bool:
+        if not self.plaintext_cache:
+            return False
+        return uid in self.plaintext_cache[0]
+
+    def _backfill_new_uid_unsafe(self, uid: int) -> None:
         if len(self.plaintext_cache) <= 1:
             return
 
         logger.info(f"🚀 New miner detected (UID: {uid}). Backfilling history.")
-        # Iterate up to the new, current timestep, but do not fill it.
-        # It will be filled later by process_pending_payloads.
         for step_cache in self.plaintext_cache[:-1]:
             if uid not in step_cache:
                 step_cache[uid] = ZERO_VEC
 
     async def process_pending_payloads(self) -> None:
-        """
-        Groups pending payloads by Drand round, fetches signatures for ready
-        rounds, and decrypts them in batches.
-        """
-        current_block = self.blocks[-1] if self.blocks else 0
-        rounds_to_process: Dict[int, List[Dict]] = {}
-        processed_payload_keys: List[tuple[int, int]] = []
+        async with self._lock:
+            payloads_to_process = copy.deepcopy(self.raw_payloads)
+            current_block = self.blocks[-1] if self.blocks else 0
+            block_map = {ts: self.blocks[ts] for ts in payloads_to_process}
 
-        # 1. Group payloads by Drand round
-        # Iterate over a copy of the items to prevent mutation issues during the loop.
-        for ts, payloads_at_step in list(self.raw_payloads.items()):
-            block_age = current_block - self.blocks[ts]
-            if not (300 <= block_age <= 600):
-                if block_age > 600:
-                    logger.warning(f"Discarding stale raw payloads at timestep {ts}")
-                    processed_payload_keys.extend([(ts, u) for u in payloads_at_step.keys()])
+        if not payloads_to_process:
+            return # Nothing to do
+
+        rounds_to_process: Dict[int, List[Dict]] = {}
+        timesteps_to_discard = []
+
+        for ts, payloads_at_step in payloads_to_process.items():
+            block_age = current_block - block_map[ts]
+
+            if block_age > 600:
+                logger.warning(f"Discarding stale raw payloads at timestep {ts} (age: {block_age} blocks)")
+                timesteps_to_discard.append(ts)
+                continue
+            
+            if not (300 <= block_age):
                 continue
 
-            for uid, payload_bytes in list(payloads_at_step.items()):
+            for uid, payload_bytes in payloads_at_step.items():
                 try:
-                    # Ensure we are working with bytes
                     if isinstance(payload_bytes, dict):
-                        # This is a corrupted entry from a previous bug, convert it back for processing
                         p = payload_bytes
                     else:
                         p = json.loads(payload_bytes)
@@ -212,55 +212,66 @@ class DataLog:
                         {"ts": ts, "uid": uid, "ct_hex": p["ciphertext"]}
                     )
                 except Exception:
-                    # This handles parsing failures (e.g., from the fallback payload)
-                    self.plaintext_cache[ts][uid] = ZERO_VEC
-                    processed_payload_keys.append((ts, uid))
+                    if "malformed" not in rounds_to_process:
+                        rounds_to_process["malformed"] = []
+                    rounds_to_process["malformed"].append({"ts": ts, "uid": uid})
         
-        # 2. Fetch signatures and decrypt ready rounds
-        for round_num, items in rounds_to_process.items():
-            sig = await self._get_drand_signature(round_num)
-            if not sig:
-                continue  # Signature not yet available
+        sem = asyncio.Semaphore(16)
+        decrypted_results = {}
+        processed_keys = []
 
-            logger.info(f"Decrypting batch of {len(items)} payloads for Drand round {round_num}")
+        async def _fetch_and_decrypt(round_num, items):
+            nonlocal processed_keys
+            if round_num == "malformed":
+                for item in items:
+                    decrypted_results.setdefault(item["ts"], {})[item["uid"]] = ZERO_VEC
+                    processed_keys.append((item['ts'], item['uid']))
+                return
 
-            # Batch decrypt all ciphertexts for this round
-            for item in items:
-                ts, uid, ct_hex = item["ts"], item["uid"], item["ct_hex"]
-                try:
-                    pt_bytes = self.tlock.tld(bytes.fromhex(ct_hex), sig)
-                    vector = ast.literal_eval(pt_bytes.decode())
-                    if self._validate_vector(vector):
-                        self.plaintext_cache[ts][uid] = vector
-                    else:
-                        self.plaintext_cache[ts][uid] = ZERO_VEC
-                except Exception as e:
-                    logger.error(f"tlock decryption failed for UID {uid} at ts {ts}: {e}")
-                    self.plaintext_cache[ts][uid] = ZERO_VEC
-                finally:
-                    processed_payload_keys.append((ts, uid))
-        
-        # 3. Clean up processed payloads from the raw queue
-        for ts, uid in processed_payload_keys:
-            if ts in self.raw_payloads and uid in self.raw_payloads[ts]:
-                del self.raw_payloads[ts][uid]
-                if not self.raw_payloads[ts]:
-                    del self.raw_payloads[ts]
+            async with sem:
+                sig = await self._get_drand_signature(round_num)
+                if not sig:
+                    return # Signature not yet available
+
+                logger.info(f"Decrypting batch of {len(items)} payloads for Drand round {round_num}")
+                for item in items:
+                    ts, uid, ct_hex = item["ts"], item["uid"], item["ct_hex"]
+                    try:
+                        pt_bytes = self.tlock.tld(bytes.fromhex(ct_hex), sig)
+                        vector = ast.literal_eval(pt_bytes.decode())
+                        result = vector if self._validate_vector(vector) else ZERO_VEC
+                    except Exception as e:
+                        logger.warning(f"tlock decryption failed for UID {uid} at ts {ts}: {e}")
+                        result = ZERO_VEC
+                    
+                    decrypted_results.setdefault(ts, {})[uid] = result
+                    processed_keys.append((ts, uid))
+
+        await asyncio.gather(*[_fetch_and_decrypt(r, i) for r, i in rounds_to_process.items()])
+
+        if decrypted_results or processed_keys or timesteps_to_discard:
+            async with self._lock:
+                for ts, uid_vectors in decrypted_results.items():
+                    if ts < len(self.plaintext_cache):
+                        self.plaintext_cache[ts].update(uid_vectors)
+
+                for ts, uid in processed_keys:
+                    if ts in self.raw_payloads and uid in self.raw_payloads[ts]:
+                        del self.raw_payloads[ts][uid]
+                        if not self.raw_payloads[ts]:
+                            del self.raw_payloads[ts]
+
+                for ts in timesteps_to_discard:
+                    if ts in self.raw_payloads:
+                        del self.raw_payloads[ts]
 
     def get_training_data(self) -> tuple[dict[int, list], list[float]] | None:
-        """
-        Prepares and returns the data required for training the salience model.
-
-        This function reads directly from the `plaintext_cache` and calculates
-        BTC price returns based on the `LAG` constant. It ensures all data is
-        aligned and correctly formatted for the model.
-        """
         if not self.plaintext_cache or len(self.blocks) < config.LAG * 2 + 1:
             logger.warning("Not enough data to create a training set.")
             return None
 
         T = len(self.blocks)
-        all_uids = self.get_all_uids()
+        all_uids = self._get_all_uids_unsafe() # Uses non-locking version
         history_dict = {uid: [] for uid in all_uids}
         btc_returns = []
 
@@ -282,31 +293,28 @@ class DataLog:
 
     @staticmethod
     def _validate_vector(vector: Any) -> bool:
-        """Checks if a decrypted vector is valid."""
         if not isinstance(vector, list) or len(vector) != config.FEATURE_LENGTH:
             return False
         return all(isinstance(v, (int, float)) and -1.0 <= v <= 1.0 for v in vector)
 
-    def save(self, path: str) -> None:
-        """Saves the entire DataLog object to a compressed file."""
-        try:
-            tmp_path = path + ".tmp"
-            with gzip.open(tmp_path, "wb") as f:
-                pickle.dump(self, f)
-            os.replace(tmp_path, path)
-            logger.info(f"💾 Saved DataLog to {path}")
-        except Exception as e:
-            logger.error(f"Error saving DataLog: {e}")
+    async def save(self, path: str) -> None:
+        async with self._lock:
+            datalog_copy = copy.deepcopy(self)
+
+        def _save_job():
+            try:
+                tmp_path = path + ".tmp"
+                with gzip.open(tmp_path, "wb") as f:
+                    pickle.dump(datalog_copy, f)
+                os.replace(tmp_path, path)
+                logger.info(f"💾 Saved DataLog to {path}")
+            except Exception as e:
+                logger.error(f"Error in background save thread: {e}", exc_info=True)
+
+        await asyncio.to_thread(_save_job)
 
     @staticmethod
     def load(path: str) -> "DataLog":
-        """
-        Loads a DataLog object.
-
-        It first tries to load from the local `path`. If the file doesn't exist,
-        it attempts to download it from the `DATALOG_ARCHIVE_URL` in the config.
-        If both fail, it returns a new, empty DataLog.
-        """
         if os.path.exists(path):
             logger.info(f"Found local DataLog at {path}")
             try:
